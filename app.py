@@ -1,481 +1,215 @@
-from flask import Flask, request, render_template, jsonify, send_file
 import os
+import platform
 import tempfile
-import threading
-import requests
-import json
-import re
-from datetime import datetime
-import yt_dlp
-import instaloader
-from werkzeug.utils import secure_filename
-import zipfile
 import shutil
+import zipfile
+import time
+import threading
+from flask import Flask, request, send_file, render_template_string
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here-change-this'
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB max per request
 
-# Create downloads directory if it doesn't exist
-DOWNLOAD_DIR = os.path.join(os.getcwd(), 'downloads')
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PPT → PDF Converter (Drag & Drop)</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;background:#f4f6f8;color:#222;display:flex;flex-direction:column;align-items:center;padding:30px}
+  h1{margin-bottom:6px}
+  .drop{width:100%;max-width:820px;height:260px;border:3px dashed #cbd5e1;border-radius:12px;display:flex;align-items:center;justify-content:center;background:white;cursor:pointer;transition:0.15s}
+  .drop.dragover{background:#eef2ff;border-color:#7c3aed}
+  .drop p{text-align:center;margin:0;padding:20px;color:#374151}
+  .btn{margin-top:16px;padding:10px 16px;border-radius:8px;border:none;background:#7c3aed;color:white;cursor:pointer;font-size:15px}
+  .btn:disabled{background:#a78bfa;cursor:not-allowed}
+  .files{margin-top:18px;width:100%;max-width:820px}
+  .filelist{background:white;padding:10px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
+  .row{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #f1f5f9}
+  .row:last-child{border-bottom:0}
+  .small{font-size:13px;color:#6b7280}
+</style>
+</head>
+<body>
+  <h1>PPT → PDF Converter</h1>
+  <div class="drop" id="drop">
+    <p>Drag & drop your .ppt / .pptx files here<br>or click to select (multiple supported)</p>
+  </div>
+  <button class="btn" id="convertBtn" disabled>Convert & Download ZIP</button>
 
-class UniversalDownloader:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-        
-    def detect_platform(self, url):
-        """Detect the platform from URL"""
-        url = url.lower()
-        if 'youtube.com' in url or 'youtu.be' in url:
-            return 'youtube'
-        elif 'instagram.com' in url:
-            return 'instagram'
-        elif 'facebook.com' in url or 'fb.watch' in url:
-            return 'facebook'
-        elif 'twitter.com' in url or 'x.com' in url:
-            return 'twitter'
-        elif 'tiktok.com' in url:
-            return 'tiktok'
-        elif 'pinterest.com' in url:
-            return 'pinterest'
-        elif 'linkedin.com' in url:
-            return 'linkedin'
-        elif 'snapchat.com' in url:
-            return 'snapchat'
-        elif 'reddit.com' in url:
-            return 'reddit'
-        elif 'twitch.tv' in url:
-            return 'twitch'
-        else:
-            return 'unknown'
-    
-    def create_safe_filename(self, filename, max_length=100):
-        """Create a safe filename"""
-        # Remove invalid characters
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        filename = filename.strip()
-        if len(filename) > max_length:
-            filename = filename[:max_length]
-        return filename
-    
-    def download_youtube_content(self, url, path):
-        """Download YouTube videos, shorts, playlists"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, '%(uploader)s - %(title)s.%(ext)s'),
-                'format': 'best[height<=1080]',
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': ['en'],
-                'ignoreerrors': True,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                
-                if 'entries' in info:  # Playlist
-                    titles = [entry.get('title', 'Unknown') for entry in info['entries'] if entry]
-                    return {
-                        'status': 'success',
-                        'message': f'Downloaded {len(titles)} videos from playlist',
-                        'titles': titles[:5],  # Show first 5 titles
-                        'type': 'playlist'
-                    }
-                else:  # Single video
-                    return {
-                        'status': 'success',
-                        'message': 'YouTube content downloaded successfully!',
-                        'title': info.get('title', 'Unknown'),
-                        'uploader': info.get('uploader', 'Unknown'),
-                        'type': 'video'
-                    }
-        except Exception as e:
-            return {'status': 'error', 'message': f'YouTube error: {str(e)}'}
-    
-    def download_instagram_content(self, url, path):
-        """Download Instagram posts, reels, stories, IGTV"""
-        try:
-            loader = instaloader.Instaloader(
-                dirname_pattern=path,
-                filename_pattern='{profile}_{mediaid}_{date_utc}',
-                download_videos=True,
-                download_video_thumbnails=False,
-                download_geotags=False,
-                download_comments=False,
-                save_metadata=True,
-                compress_json=False
-            )
-            
-            # Handle different Instagram URL types
-            if '/stories/' in url:
-                # Story URL
-                username = self.extract_instagram_username(url)
-                if username:
-                    profile = instaloader.Profile.from_username(loader.context, username)
-                    for story in loader.get_stories([profile.userid]):
-                        for item in story.get_items():
-                            loader.download_storyitem(item, target=username)
-                    return {
-                        'status': 'success',
-                        'message': f'Instagram stories downloaded for {username}',
-                        'type': 'stories'
-                    }
-            elif '/reel/' in url or '/p/' in url or '/tv/' in url:
-                # Post, Reel, or IGTV
-                shortcode = self.extract_instagram_shortcode(url)
-                post = instaloader.Post.from_shortcode(loader.context, shortcode)
-                
-                loader.download_post(post, target=post.owner_username)
-                
-                content_type = 'reel' if post.is_video else 'post'
-                if post.typename == 'GraphSidecar':
-                    content_type = 'carousel'
-                
-                return {
-                    'status': 'success',
-                    'message': f'Instagram {content_type} downloaded successfully!',
-                    'username': post.owner_username,
-                    'caption': post.caption[:100] + '...' if post.caption and len(post.caption) > 100 else post.caption,
-                    'type': content_type
-                }
-            else:
-                # Profile URL - download recent posts
-                username = self.extract_instagram_username(url)
-                profile = instaloader.Profile.from_username(loader.context, username)
-                
-                count = 0
-                for post in profile.get_posts():
-                    if count >= 10:  # Limit to 10 recent posts
-                        break
-                    loader.download_post(post, target=username)
-                    count += 1
-                
-                return {
-                    'status': 'success',
-                    'message': f'Downloaded {count} recent posts from {username}',
-                    'type': 'profile'
-                }
-                
-        except Exception as e:
-            return {'status': 'error', 'message': f'Instagram error: {str(e)}'}
-    
-    def download_tiktok_content(self, url, path):
-        """Download TikTok videos"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, 'TikTok_%(uploader)s_%(title)s.%(ext)s'),
-                'format': 'best',
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return {
-                    'status': 'success',
-                    'message': 'TikTok video downloaded successfully!',
-                    'title': info.get('title', 'TikTok Video'),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'type': 'video'
-                }
-        except Exception as e:
-            return {'status': 'error', 'message': f'TikTok error: {str(e)}'}
-    
-    def download_twitter_content(self, url, path):
-        """Download Twitter/X videos, images, threads"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, 'Twitter_%(uploader)s_%(title)s.%(ext)s'),
-                'writesubtitles': True,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return {
-                    'status': 'success',
-                    'message': 'Twitter content downloaded successfully!',
-                    'title': info.get('title', 'Twitter Content'),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'type': 'tweet'
-                }
-        except Exception as e:
-            return {'status': 'error', 'message': f'Twitter error: {str(e)}'}
-    
-    def download_facebook_content(self, url, path):
-        """Download Facebook videos, posts"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, 'Facebook_%(title)s.%(ext)s'),
-                'format': 'best',
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return {
-                    'status': 'success',
-                    'message': 'Facebook content downloaded successfully!',
-                    'title': info.get('title', 'Facebook Content'),
-                    'type': 'video'
-                }
-        except Exception as e:
-            return {'status': 'error', 'message': f'Facebook error: {str(e)}'}
-    
-    def download_reddit_content(self, url, path):
-        """Download Reddit videos, images, gifs"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, 'Reddit_%(title)s.%(ext)s'),
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return {
-                    'status': 'success',
-                    'message': 'Reddit content downloaded successfully!',
-                    'title': info.get('title', 'Reddit Post'),
-                    'type': 'post'
-                }
-        except Exception as e:
-            return {'status': 'error', 'message': f'Reddit error: {str(e)}'}
-    
-    def download_generic_content(self, url, path):
-        """Download from any supported platform using yt-dlp"""
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(path, '%(extractor)s_%(title)s.%(ext)s'),
-                'format': 'best',
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return {
-                    'status': 'success',
-                    'message': 'Content downloaded successfully!',
-                    'title': info.get('title', 'Unknown'),
-                    'extractor': info.get('extractor', 'Unknown'),
-                    'type': 'media'
-                }
-        except Exception as e:
-            return {'status': 'error', 'message': f'Download error: {str(e)}'}
-    
-    def extract_instagram_shortcode(self, url):
-        """Extract shortcode from Instagram URL"""
-        patterns = [
-            r'/p/([^/?]+)',
-            r'/reel/([^/?]+)',
-            r'/tv/([^/?]+)'
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return None
-    
-    def extract_instagram_username(self, url):
-        """Extract username from Instagram URL"""
-        match = re.search(r'instagram\.com/([^/?]+)', url)
-        if match:
-            return match.group(1)
-        return None
-    
-    def download_content(self, url, custom_path=None):
-        """Main download function"""
-        path = custom_path or DOWNLOAD_DIR
-        platform = self.detect_platform(url)
-        
-        # Create timestamped folder for this download
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        download_folder = os.path.join(path, f"{platform}_{timestamp}")
-        os.makedirs(download_folder, exist_ok=True)
-        
-        try:
-            if platform == 'youtube':
-                return self.download_youtube_content(url, download_folder)
-            elif platform == 'instagram':
-                return self.download_instagram_content(url, download_folder)
-            elif platform == 'tiktok':
-                return self.download_tiktok_content(url, download_folder)
-            elif platform == 'twitter':
-                return self.download_twitter_content(url, download_folder)
-            elif platform == 'facebook':
-                return self.download_facebook_content(url, download_folder)
-            elif platform == 'reddit':
-                return self.download_reddit_content(url, download_folder)
-            else:
-                # Try generic download for other platforms
-                return self.download_generic_content(url, download_folder)
-                
-        except Exception as e:
-            return {'status': 'error', 'message': f'Unexpected error: {str(e)}'}
+  <div class="files" id="filesArea" style="display:none">
+    <div class="filelist" id="fileList"></div>
+  </div>
 
-# Initialize downloader
-downloader = UniversalDownloader()
+<script>
+const drop = document.getElementById('drop');
+const fileList = document.getElementById('fileList');
+const filesArea = document.getElementById('filesArea');
+const convertBtn = document.getElementById('convertBtn');
+let files = [];
 
-@app.route('/')
+function updateUI(){
+  if(files.length === 0){
+    filesArea.style.display = 'none';
+    convertBtn.disabled = true;
+  } else {
+    filesArea.style.display = 'block';
+    convertBtn.disabled = false;
+  }
+  fileList.innerHTML = files.map(f => {
+    return `<div class="row"><div><strong>${escapeHtml(f.name)}</strong><div class="small">${formatBytes(f.size)}</div></div><div class="small">Ready</div></div>`;
+  }).join('');
+}
+
+function escapeHtml(s){ 
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+function formatBytes(bytes){
+  if(bytes < 1024) return bytes + ' B';
+  let kb = bytes / 1024;
+  if(kb < 1024) return kb.toFixed(1) + ' KB';
+  let mb = kb / 1024;
+  if(mb < 1024) return mb.toFixed(1) + ' MB';
+  return (mb / 1024).toFixed(1) + ' GB';
+}
+
+drop.addEventListener('click', ()=> {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.multiple = true;
+  inp.accept = '.ppt,.pptx';
+  inp.onchange = e => { files = files.concat(Array.from(inp.files)); updateUI(); };
+  inp.click();
+});
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+drop.addEventListener('dragleave', e => { drop.classList.remove('dragover'); });
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('dragover');
+  const dropped = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.ppt') || f.name.toLowerCase().endsWith('.pptx'));
+  files = files.concat(dropped);
+  updateUI();
+});
+
+convertBtn.addEventListener('click', async () => {
+  if(files.length === 0) return;
+  convertBtn.disabled = true; convertBtn.textContent = 'Converting...';
+  const form = new FormData();
+  files.forEach(f => form.append('files', f));
+  try {
+    const resp = await fetch('/upload', { method:'POST', body: form });
+    if(!resp.ok){ const txt = await resp.text(); alert('Server error: ' + txt); resetBtn(); return; }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'converted_pdfs.zip';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    convertBtn.textContent = 'Done ✓';
+    setTimeout(()=>{ resetBtn(); files = []; updateUI(); }, 1400);
+  } catch (err) { alert('Error: ' + err.message); resetBtn(); }
+});
+
+function resetBtn(){ convertBtn.disabled = false; convertBtn.textContent = 'Convert & Download ZIP'; }
+</script>
+</body>
+</html>
+"""
+def convert_with_com_windows(input_path, output_path):
+    try:
+        import pythoncom
+        from win32com.client import Dispatch
+    except Exception as e:
+        return False, f"pywin32 not installed or failed: {e}"
+
+    try:
+        pythoncom.CoInitialize()
+        powerpoint = Dispatch("PowerPoint.Application")
+        powerpoint.Visible = 1  # visible, warna 2013 error aata hai
+
+        # Window ko minimize karna try karo taaki user disturb na ho:
+        # PowerPoint.Application.WindowState = 2 means minimized
+        try:
+            powerpoint.WindowState = 2  # minimize PowerPoint window
+        except Exception:
+            pass  # agar error aaye to ignore karo
+
+        presentation = powerpoint.Presentations.Open(input_path, WithWindow=False)
+        presentation.SaveAs(output_path, 32)  # 32 = ppSaveAsPDF
+        presentation.Close()
+        powerpoint.Quit()
+        pythoncom.CoUninitialize()
+        return True, None
+    except Exception as e:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+        return False, str(e)
+
+
+@app.route("/")
 def index():
-    """Main page"""
-    return render_template('index.html')
+    return render_template_string(INDEX_HTML)
 
-@app.route('/download', methods=['POST'])
-def download():
-    """Handle download requests"""
+@app.route("/upload", methods=["POST"])
+def upload():
+    if platform.system() != "Windows":
+        return "This service currently only supports Windows with MS PowerPoint installed.", 400
+
+    if 'files' not in request.files:
+        return "No files uploaded", 400
+
+    files = request.files.getlist('files')
+    if not files:
+        return "No files uploaded", 400
+
+    tmpdir = tempfile.mkdtemp(prefix="ppt2pdf_")
+    outdir = os.path.join(tmpdir, "out")
+    os.makedirs(outdir, exist_ok=True)
+    created = []
+
     try:
-        data = request.get_json()
-        url = data.get('url', '').strip()
-        
-        if not url:
-            return jsonify({'status': 'error', 'message': 'URL is required'})
-        
-        # Detect platform automatically
-        platform = downloader.detect_platform(url)
-        
-        # Start download
-        result = downloader.download_content(url)
-        result['platform'] = platform
-        
-        return jsonify(result)
-        
+        for f in files:
+            filename = secure_filename(f.filename) or "upload.pptx"
+            if not filename.lower().endswith(('.ppt', '.pptx')):
+                continue
+            inpath = os.path.join(tmpdir, filename)
+            f.save(inpath)
+            base = os.path.splitext(filename)[0]
+            pdfpath = os.path.join(outdir, base + ".pdf")
+
+            ok, err = convert_with_com_windows(inpath, pdfpath)
+            if ok and os.path.exists(pdfpath):
+                created.append(pdfpath)
+            else:
+                return f"Conversion failed for {filename}: {err}", 500
+
+        if not created:
+            return "No valid PPT/PPTX files converted.", 400
+
+        zip_path = os.path.join(tmpdir, "converted_pdfs.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for p in created:
+                zf.write(p, arcname=os.path.basename(p))
+
+        def cleanup_later(dirpath, delay=5):
+            time.sleep(delay)
+            try:
+                shutil.rmtree(dirpath)
+            except Exception:
+                pass
+
+        threading.Thread(target=cleanup_later, args=(tmpdir,), daemon=True).start()
+        return send_file(zip_path, as_attachment=True, download_name="converted_pdfs.zip")
+
     except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Server error: {str(e)}'})
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        return f"Server error: {e}", 500
 
-@app.route('/bulk-download', methods=['POST'])
-def bulk_download():
-    """Handle bulk download requests"""
-    try:
-        data = request.get_json()
-        urls = data.get('urls', [])
-        
-        if not urls:
-            return jsonify({'status': 'error', 'message': 'URLs list is required'})
-        
-        results = []
-        for url in urls:
-            if url.strip():
-                result = downloader.download_content(url.strip())
-                result['url'] = url
-                results.append(result)
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Processed {len(results)} URLs',
-            'results': results
-        })
-        
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Bulk download error: {str(e)}'})
-
-@app.route('/downloads')
-def list_downloads():
-    """List downloaded files and folders"""
-    try:
-        items = []
-        if os.path.exists(DOWNLOAD_DIR):
-            for item in os.listdir(DOWNLOAD_DIR):
-                item_path = os.path.join(DOWNLOAD_DIR, item)
-                if os.path.isfile(item_path):
-                    items.append({
-                        'name': item,
-                        'type': 'file',
-                        'size': os.path.getsize(item_path)
-                    })
-                elif os.path.isdir(item_path):
-                    file_count = len([f for f in os.listdir(item_path) if os.path.isfile(os.path.join(item_path, f))])
-                    items.append({
-                        'name': item,
-                        'type': 'folder',
-                        'file_count': file_count
-                    })
-        
-        return jsonify({'items': items})
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
-@app.route('/download-file/<path:filename>')
-def download_file(filename):
-    """Download a specific file"""
-    try:
-        safe_filename = secure_filename(filename)
-        file_path = os.path.join(DOWNLOAD_DIR, safe_filename)
-        
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True)
-        else:
-            return jsonify({'error': 'File not found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/download-folder/<foldername>')
-def download_folder(foldername):
-    """Download a folder as ZIP"""
-    try:
-        safe_foldername = secure_filename(foldername)
-        folder_path = os.path.join(DOWNLOAD_DIR, safe_foldername)
-        
-        if os.path.exists(folder_path) and os.path.isdir(folder_path):
-            # Create a temporary ZIP file
-            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-            temp_zip.close()
-            
-            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(folder_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, folder_path)
-                        zipf.write(file_path, arcname)
-            
-            return send_file(temp_zip.name, as_attachment=True, download_name=f'{safe_foldername}.zip')
-        else:
-            return jsonify({'error': 'Folder not found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/supported-platforms')
-def supported_platforms():
-    """List supported platforms"""
-    platforms = {
-        'video_platforms': [
-            'YouTube (videos, shorts, playlists)',
-            'TikTok',
-            'Twitter/X',
-            'Facebook',
-            'Instagram (Reels, IGTV)',
-            'Reddit',
-            'Twitch',
-            'Vimeo',
-            'Dailymotion'
-        ],
-        'social_platforms': [
-            'Instagram (Posts, Stories, Reels, IGTV)',
-            'Twitter/X (Tweets, Threads)',
-            'Facebook (Posts, Videos)',
-            'Reddit (Posts, Images, Videos)',
-            'LinkedIn (Posts)',
-            'Pinterest (Pins)'
-        ],
-        'features': [
-            'Auto-platform detection',
-            'Bulk downloads',
-            'Stories download',
-            'Playlist support',
-            'High quality downloads',
-            'Metadata preservation',
-            'Subtitle downloads'
-        ]
-    }
-    return jsonify(platforms)
-
-@app.route('/clear-downloads', methods=['POST'])
-def clear_downloads():
-    """Clear all downloaded files"""
-    try:
-        if os.path.exists(DOWNLOAD_DIR):
-            shutil.rmtree(DOWNLOAD_DIR)
-            os.makedirs(DOWNLOAD_DIR)
-        return jsonify({'status': 'success', 'message': 'Downloads cleared successfully'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Error clearing downloads: {str(e)}'})
-
-if __name__ == '__main__':
-  app.run(debug=True)
+if __name__ == "__main__":
+    # Only for local testing, do not expose publicly without security.
+    app.run(host="0.0.0.0", port=5000, debug=True)

@@ -1,5 +1,2 @@
 Flask
-yt-dlp
-instaloader
-requests
-beautifulsoup4
+pywin32
